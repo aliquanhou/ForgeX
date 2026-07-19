@@ -67,81 +67,110 @@ async def create_task(request: TaskRequest) -> TaskResponse:
     task_id = runtime.state.task_id
     _tasks[request.goal] = runtime
 
-    # ── Register default handlers so tasks produce meaningful output ──
+    # ── Intent Router: 判断是闲聊还是工程任务 ──
+    from forge.cognition.intent_router import IntentRouter
     from forge.llm.client import LLMClient
     from forge.config import config
     from forge.kernel.event_bus import Event, EventKind
+    from forge.kernel.state import TaskPhase
     from forge.cognition import prompt_compiler
     llm = LLMClient(
         api_key=config.llm_api_key,
         base_url=config.llm_base_url,
         default_model=config.llm_model,
     )
-    llm_response: dict[str, str] = {}
+
+    router = IntentRouter()
+    route = router.route(request.goal)
 
     async def publish(kind: EventKind, payload: dict):
         await event_bus.publish(Event(kind=kind, payload=payload, task_id=task_id))
 
+    # Detect before task starts — publish route event
+    await publish(EventKind.INTENT_DETECTED, {
+        "category": route.category.value,
+        "confidence": route.confidence,
+        "reason": route.reason,
+    })
+
     def track_tokens(resp):
-        """Record LLM token usage into runtime state and budget."""
         tokens = (resp.tokens_in or 0) + (resp.tokens_out or 0)
         if tokens:
             runtime.state.total_tokens_used += tokens
             runtime.budget.consume_tokens(tokens)
 
-    async def plan_handler(state):
-        goal = state.goal
-        state.current_plan = "1. Understand request\n2. Analyze context\n3. Generate response"
-        await publish(EventKind.FACT_CONFIRMED, {"fact": f"Planning for: {goal}", "source": "scheduler", "confidence": 1.0})
-        state.add_fact(f"Plan: analyze and respond to: {goal[:80]}")
+    llm_response: dict[str, str] = {}
 
-    async def explore_handler(state):
-        await publish(EventKind.FACT_CONFIRMED, {"fact": f"Analyzing: {state.goal[:80]}", "source": "scheduler", "confidence": 1.0})
-        state.add_fact(f"Exploring request: {state.goal[:80]}")
+    async def _emit_stream(full, source="llm"):
+        """Emit LLM response progressively in chunks."""
+        chunk_size = 80
+        emitted = ""
+        for i in range(0, len(full), chunk_size):
+            chunk = full[i:i+chunk_size]
+            emitted += chunk
+            is_last = i + chunk_size >= len(full)
+            await publish(EventKind.FACT_CONFIRMED, {
+                "fact": emitted, "source": source, "confidence": 1.0,
+                "is_final": is_last, "is_streaming": not is_last,
+            })
+            if not is_last:
+                await asyncio.sleep(0.15)
 
-    async def implement_handler(state):
-        """Single LLM call — emit response progressively in chunks."""
-        try:
-            system_prompt = prompt_compiler.compile(state)
-            resp = await llm.chat(
-                f"User request: {state.goal}\n\nProvide a complete, helpful response. Be concise and direct.",
-                system=system_prompt,
-                max_tokens=1000,
-            )
-            track_tokens(resp)
-            llm_response["result"] = resp.content
-            state.add_fact(f"Result: {resp.content[:300]}")
-            # Emit progressively — split into chunks for streaming feel
-            full = resp.content
-            chunk_size = 80
-            emitted = ""
-            for i in range(0, len(full), chunk_size):
-                chunk = full[i:i+chunk_size]
-                emitted += chunk
-                is_last = i + chunk_size >= len(full)
+    # ── 分流：Conversation vs Engineering ──
+    if route.category == "conversation":
+        # Conversation: 一轮 LLM 回复，不走工程管道
+        async def conversation_handler(state):
+            try:
+                prompt = prompt_compiler.compile(state) + "\n\n你是友好对话助手，用中文简洁回复。"
+                resp = await llm.chat(state.goal, system=prompt, max_tokens=600)
+                track_tokens(resp)
+                state.add_fact(f"Reply: {resp.content[:200]}")
+                await _emit_stream(resp.content)
+            except Exception:
                 await publish(EventKind.FACT_CONFIRMED, {
-                    "fact": emitted,
-                    "source": "llm",
-                    "confidence": 1.0,
-                    "is_final": is_last,
-                    "is_streaming": not is_last,
-                })
-                if not is_last:
-                    await asyncio.sleep(0.15)
-        except Exception as e:
-            await publish(EventKind.FACT_CONFIRMED, {"fact": "Processing request... (LLM unavailable)", "source": "default", "confidence": 0.5})
+                    "fact": "你好！我是 ForgeX Agent OS，有什么可以帮助你的？",
+                    "source": "default", "confidence": 0.5})
+            # Short-circuit: skip to COMPLETED immediately
+            state.phase = TaskPhase.COMPLETED
 
-    async def verify_handler(state):
-        if "result" in llm_response:
-            state.add_fact("Response generated successfully")
-            await publish(EventKind.FACT_CONFIRMED, {"fact": "Response generated successfully", "source": "verifier", "confidence": 1.0})
-        else:
-            state.add_fact("Task completed")
+        runtime.on_plan(conversation_handler)
 
-    runtime.on_plan(plan_handler)
-    runtime.on_explore(explore_handler)
-    runtime.on_implement(implement_handler)
-    runtime.on_verify(verify_handler)
+    else:
+        # Engineering: 完整管道
+        async def plan_handler(state):
+            await publish(EventKind.FACT_CONFIRMED, {"fact": f"Planning for: {state.goal}", "source": "scheduler", "confidence": 1.0})
+            state.current_plan = "1. Understand\n2. Analyze\n3. Execute"
+            state.add_fact(f"Plan: {state.goal[:80]}")
+
+        async def explore_handler(state):
+            await publish(EventKind.FACT_CONFIRMED, {"fact": f"Analyzing: {state.goal[:80]}", "source": "scheduler", "confidence": 1.0})
+            state.add_fact(f"Exploring: {state.goal[:80]}")
+
+        async def implement_handler(state):
+            try:
+                system_prompt = prompt_compiler.compile(state)
+                resp = await llm.chat(
+                    f"User request: {state.goal}\n\nProvide a complete, helpful response.",
+                    system=system_prompt, max_tokens=1000,
+                )
+                track_tokens(resp)
+                llm_response["result"] = resp.content
+                state.add_fact(f"Result: {resp.content[:300]}")
+                await _emit_stream(resp.content)
+            except Exception:
+                await publish(EventKind.FACT_CONFIRMED, {"fact": "Unable to process request.", "source": "default", "confidence": 0.5})
+
+        async def verify_handler(state):
+            if "result" in llm_response:
+                state.add_fact("Response generated successfully")
+                await publish(EventKind.FACT_CONFIRMED, {"fact": "Response generated successfully", "source": "verifier", "confidence": 1.0})
+            else:
+                state.add_fact("Task completed")
+
+        runtime.on_plan(plan_handler)
+        runtime.on_explore(explore_handler)
+        runtime.on_implement(implement_handler)
+        runtime.on_verify(verify_handler)
 
     # Start execution in background -- events flow via EventBus -> SSE
     async def _run():

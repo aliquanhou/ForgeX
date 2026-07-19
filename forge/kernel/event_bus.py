@@ -29,6 +29,7 @@ class EventKind(str, Enum):
 
     # Decisions
     INTENT_CLASSIFIED = "intent_classified"
+    INTENT_DETECTED = "intent_detected"
     PLAN_CREATED = "plan_created"
     ACTION_SELECTED = "action_selected"
 
