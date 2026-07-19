@@ -225,16 +225,18 @@ async def test_acl02_takeover():
     rt = Runtime(token_budget=100000, round_limit=20)
 
     async def plan(state):
-        await asyncio.sleep(0.1)
-        state.add_fact("planned")
+        for i in range(4):
+            await asyncio.sleep(0.3)
+            state.add_fact(f"plan_step_{i}")
 
     async def explore(state):
-        await asyncio.sleep(0.1)
-        state.add_fact("explored")
+        for i in range(4):
+            await asyncio.sleep(0.3)
+            state.add_fact(f"explore_step_{i}")
 
     async def implement(state):
-        for i in range(3):
-            await asyncio.sleep(0.1)
+        for i in range(5):
+            await asyncio.sleep(0.3)
             state.add_change(f"agent_change_{i}")
             state.add_fact(f"agent_fact_{i}")
 
@@ -257,7 +259,7 @@ async def test_acl02_takeover():
     collector_task = asyncio.create_task(collector())
     run_task = asyncio.create_task(rt.run("acl-02 takeover test"))
 
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.5)
 
     # ── TAKE OVER ──
     await rt.take_over()
@@ -327,7 +329,7 @@ async def test_acl02_takeover():
     check("task reached terminal state", rt.state.is_terminal,
           f"phase={rt.state.phase}")
 
-    print(f"\n  Events logged: {len(events)}")
+    print(f"\n  Events ({len(events)}): {[e.kind.value for e in events]}")
     print(f"\nACL-02: {PASS}/{PASS+FAIL} passed")
     return FAIL == 0
 
