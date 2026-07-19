@@ -71,6 +71,7 @@ async def create_task(request: TaskRequest) -> TaskResponse:
     from forge.llm.client import LLMClient
     from forge.config import config
     from forge.kernel.event_bus import Event, EventKind
+    from forge.cognition import prompt_compiler
     llm = LLMClient(
         api_key=config.llm_api_key,
         base_url=config.llm_base_url,
@@ -101,9 +102,10 @@ async def create_task(request: TaskRequest) -> TaskResponse:
     async def implement_handler(state):
         """Single LLM call — emit response progressively in chunks."""
         try:
+            system_prompt = prompt_compiler.compile(state)
             resp = await llm.chat(
                 f"User request: {state.goal}\n\nProvide a complete, helpful response. Be concise and direct.",
-                system="You are ForgeX Agent OS, an AI engineering assistant. Be concise, practical, and thorough.",
+                system=system_prompt,
                 max_tokens=1000,
             )
             track_tokens(resp)

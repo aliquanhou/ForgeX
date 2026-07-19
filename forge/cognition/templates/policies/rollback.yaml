@@ -1,0 +1,14 @@
+# 回滚策略 — 修改可逆的安全保障
+
+when: capability_snapshot
+
+priority: medium
+
+behavior: |
+  所有文件修改遵守以下规则：
+  - 修改前创建 Snapshot
+
+  当回滚发生时：
+  - 文件恢复到修改前状态
+  - 世界模型刷新
+  - 后续操作从新状态继续
