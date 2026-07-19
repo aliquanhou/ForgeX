@@ -196,7 +196,7 @@ async def test_acl01_pause_resume():
     for i, ev in enumerate(events):
         k = ev.kind.value if hasattr(ev.kind, 'value') else str(ev.kind)
         if k in show:
-            p = json.dumps(ev.payload, ensure_ascii=False)[:60]
+            p = json.dumps(ev.payload, ensure_ascii=True)[:60]
             print(f"    [{i:3d}] {k:25s} {p}")
 
     print(f"\n  Total events: {len(events)}")
