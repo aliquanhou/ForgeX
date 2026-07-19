@@ -138,6 +138,7 @@ class Runtime:
         """Human takes over control. Agent loop pauses."""
         self.state.human_override = True
         self.state.paused = True
+        self._pause_event.clear()
         await event_bus.publish(Event(
             kind=EventKind.HUMAN_OVERRIDE_STARTED,
             payload={"task_id": self.state.task_id, "phase": self.state.phase.value},
