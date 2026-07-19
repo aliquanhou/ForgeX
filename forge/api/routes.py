@@ -196,6 +196,97 @@ async def trigger_demo() -> dict[str, Any]:
     return {"status": "started", "message": "Demo replay started. Connect SSE to watch."}
 
 
+# ── v0.3.3 Autonomous Control Layer ──────────────────────────
+
+
+def _find_runtime(task_id: str) -> Runtime:
+    """Find a running Runtime by task_id."""
+    for goal, runtime in _tasks.items():
+        if runtime.state.task_id == task_id:
+            if runtime.state.is_terminal:
+                raise HTTPException(status_code=400, detail=f"Task {task_id} has already terminated")
+            return runtime
+    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+
+class ModeRequest(BaseModel):
+    mode: str
+
+
+@router.post("/tasks/{task_id}/pause")
+async def pause_task(task_id: str) -> dict[str, Any]:
+    """Pause the runtime loop."""
+    runtime = _find_runtime(task_id)
+    await runtime.pause()
+    return {"task_id": task_id, "status": "paused"}
+
+
+@router.post("/tasks/{task_id}/resume")
+async def resume_task(task_id: str) -> dict[str, Any]:
+    """Resume from pause / end human override."""
+    runtime = _find_runtime(task_id)
+    await runtime.resume()
+    return {"task_id": task_id, "status": "resumed"}
+
+
+@router.post("/tasks/{task_id}/takeover")
+async def takeover_task(task_id: str) -> dict[str, Any]:
+    """Human takes over control from the agent."""
+    runtime = _find_runtime(task_id)
+    await runtime.take_over()
+    return {"task_id": task_id, "status": "human_override"}
+
+
+@router.post("/tasks/{task_id}/rollback")
+async def rollback_task(task_id: str) -> dict[str, Any]:
+    """Roll back the last snapshot."""
+    runtime = _find_runtime(task_id)
+    result = await runtime.rollback()
+    return {"task_id": task_id, **result}
+
+
+@router.post("/tasks/{task_id}/stop")
+async def stop_task(task_id: str) -> dict[str, Any]:
+    """Cancel the task immediately."""
+    runtime = _find_runtime(task_id)
+    await runtime.stop()
+    return {"task_id": task_id, "status": "stopped"}
+
+
+@router.post("/tasks/{task_id}/mode")
+async def set_task_mode(task_id: str, req: ModeRequest) -> dict[str, Any]:
+    """Switch runtime mode: autonomous | observe | governed."""
+    runtime = _find_runtime(task_id)
+    try:
+        await runtime.set_mode(req.mode)
+        return {"task_id": task_id, "mode": req.mode}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/tasks/{task_id}/status")
+async def task_status(task_id: str) -> dict[str, Any]:
+    """Get full task status including control state."""
+    for goal, runtime in _tasks.items():
+        if runtime.state.task_id == task_id:
+            s = runtime.state
+            return {
+                "task_id": task_id,
+                "goal": s.goal,
+                "phase": s.phase.value,
+                "round": s.round,
+                "mode": s.mode.value,
+                "paused": s.paused,
+                "human_override": s.human_override,
+                "is_running": not s.is_terminal,
+                "tokens_used": s.total_tokens_used,
+            }
+    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+
+# ── Health ─────────────────────────────────────────────
+
+
 @router.get("/health")
 async def health() -> dict[str, Any]:
     """Health check endpoint."""

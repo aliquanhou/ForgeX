@@ -101,6 +101,102 @@ class Runtime:
     def plugin(self, name: str, handler: Callable[..., Any]) -> None:
         self._plugins[name] = handler
 
+    # -- v0.3.3 Autonomous Control Layer --
+
+    async def pause(self) -> None:
+        """Pause the runtime loop at the next safe point."""
+        self.state.paused = True
+        await event_bus.publish(Event(
+            kind=EventKind.RUNTIME_PAUSED,
+            payload={"task_id": self.state.task_id},
+            task_id=self.state.task_id,
+        ))
+
+    async def resume(self) -> None:
+        """Resume from pause."""
+        self.state.paused = False
+        if self.state.human_override:
+            self.state.human_override = False
+            await event_bus.publish(Event(
+                kind=EventKind.HUMAN_OVERRIDE_ENDED,
+                payload={"task_id": self.state.task_id},
+                task_id=self.state.task_id,
+            ))
+        await event_bus.publish(Event(
+            kind=EventKind.RUNTIME_RESUMED,
+            payload={"task_id": self.state.task_id},
+            task_id=self.state.task_id,
+        ))
+
+    async def take_over(self) -> None:
+        """Human takes over control. Agent loop pauses."""
+        self.state.human_override = True
+        self.state.paused = True
+        await event_bus.publish(Event(
+            kind=EventKind.HUMAN_OVERRIDE_STARTED,
+            payload={"task_id": self.state.task_id, "phase": self.state.phase.value},
+            task_id=self.state.task_id,
+        ))
+
+    async def rollback(self) -> dict[str, Any]:
+        """Roll back the last snapshot. Returns rollback info."""
+        from forge.snapshot.snapshot import SnapshotManager
+        sm = SnapshotManager()
+        # Use last snapshot from state
+        if not self.state.snapshot_id:
+            return {"rolled_back": False, "reason": "No snapshot available"}
+        try:
+            # Find and restore the snapshot with matching task_id
+            from pathlib import Path
+            workspace = Path.home() / "forge_workspace"
+            snap_dir = workspace / ".forge_snapshots"
+            if snap_dir.exists():
+                import json
+                for f in sorted(snap_dir.glob("*.json"), reverse=True):
+                    data = json.loads(f.read_text())
+                    if data.get("task_id") == self.state.task_id:
+                        # Restore each file in the snapshot
+                        restored = []
+                        for snap in data.get("snapshots", []):
+                            from forge.snapshot.snapshot import Snapshot
+                            s = Snapshot(**snap) if isinstance(snap, dict) else snap
+                            if s.restore():
+                                restored.append(s.file_path)
+                        await event_bus.publish(Event(
+                            kind=EventKind.ROLLBACK_COMPLETED,
+                            payload={"task_id": self.state.task_id, "files_restored": restored},
+                            task_id=self.state.task_id,
+                        ))
+                        return {"rolled_back": True, "files_restored": restored}
+        except Exception as e:
+            return {"rolled_back": False, "reason": str(e)}
+        return {"rolled_back": False, "reason": "No snapshot found"}
+
+    async def stop(self) -> None:
+        """Stop the task immediately. Keeps stream, artifacts, snapshots intact."""
+        self.state.phase = TaskPhase.CANCELLED
+        self.state.paused = False
+        await event_bus.publish(Event(
+            kind=EventKind.RUNTIME_STOPPED,
+            payload={"task_id": self.state.task_id, "phase": "cancelled"},
+            task_id=self.state.task_id,
+        ))
+
+    async def set_mode(self, mode: str) -> None:
+        """Switch runtime mode. Takes effect immediately."""
+        from .state import RuntimeMode
+        try:
+            new_mode = RuntimeMode(mode)
+            old_mode = self.state.mode.value
+            self.state.mode = new_mode
+            await event_bus.publish(Event(
+                kind=EventKind.MODE_CHANGED,
+                payload={"task_id": self.state.task_id, "from": old_mode, "to": new_mode.value},
+                task_id=self.state.task_id,
+            ))
+        except ValueError:
+            raise ValueError(f"Invalid mode: {mode}. Must be one of: autonomous, observe, governed")
+
     # -- Main loop --
 
     async def run(self, goal: str, session_id: str = "") -> RuntimeResult:
@@ -143,6 +239,12 @@ class Runtime:
         # Main loop — THIS IS THE CORE
         try:
             while not self.state.is_terminal:
+                # 0. Check pause/stop (v0.3.3 Autonomous Control Layer)
+                if self.state.phase == TaskPhase.CANCELLED:
+                    break
+                while self.state.paused:
+                    await asyncio.sleep(0.5)
+
                 # 1. Check budgets
                 if self.budget.is_exhausted:
                     self.state.phase = TaskPhase.FAILED

@@ -49,6 +49,13 @@ class Artifact:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class RuntimeMode(str, Enum):
+    """v0.3.3 Autonomous Control Layer — runtime operation modes."""
+    AUTONOMOUS = "autonomous"  # Default: full autonomy, no pauses
+    OBSERVE = "observe"        # Autonomous + key actions highlighted
+    GOVERNED = "governed"      # High-risk actions pause for approval
+
+
 @dataclass
 class RuntimeState:
     """Compressed runtime state — what gets fed to the LLM for decision-making.
@@ -93,6 +100,11 @@ class RuntimeState:
 
     # Snapshot
     snapshot_id: str = ""
+
+    # --- v0.3.3 Autonomous Control Layer ---
+    mode: RuntimeMode = RuntimeMode.AUTONOMOUS
+    paused: bool = False
+    human_override: bool = False
 
     # --- Derived / computed helpers ---
 

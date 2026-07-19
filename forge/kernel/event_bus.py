@@ -61,6 +61,15 @@ class EventKind(str, Enum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     FORCE_FINALIZE = "force_finalize"
 
+    # Runtime control (v0.3.3 Autonomous Control Layer)
+    RUNTIME_PAUSED = "runtime_paused"
+    RUNTIME_RESUMED = "runtime_resumed"
+    HUMAN_OVERRIDE_STARTED = "human_override_started"
+    HUMAN_OVERRIDE_ENDED = "human_override_ended"
+    ROLLBACK_COMPLETED = "rollback_completed"
+    RUNTIME_STOPPED = "runtime_stopped"
+    MODE_CHANGED = "mode_changed"
+
     # Log
     LOG = "log"
     ERROR = "error"
