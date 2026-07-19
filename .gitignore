@@ -24,3 +24,10 @@ forge_workspace/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime logs
+server.log
+server.err
+
+# Temp test files
+test_*.py

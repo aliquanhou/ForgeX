@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api", tags=["forge"])
 # In-memory task store (replace with PostgreSQL later)
 _tasks: dict[str, Runtime] = {}
 _task_results: dict[str, RuntimeResult] = {}
+_pending_runs: dict[str, asyncio.Task] = {}
 
 
 # --- Request/Response models ---
@@ -58,19 +59,31 @@ class TaskListResponse(BaseModel):
 
 @router.post("/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest) -> TaskResponse:
-    """Create a new task and start execution."""
+    """Create and start a task. Execution begins immediately in background."""
     runtime = Runtime(
         token_budget=request.token_budget,
         round_limit=request.round_limit,
     )
+    task_id = runtime.state.task_id
+    _tasks[request.goal] = runtime
 
-    _tasks[request.goal] = runtime  # key by goal for dedup, use task_id later
+    # Start execution in background -- events flow via EventBus -> SSE
+    async def _run():
+        try:
+            result = await runtime.run(request.goal, request.session_id)
+            _task_results[task_id] = result
+        except Exception as e:
+            print(f"  [Runtime] Task {task_id} failed: {e}")
+        finally:
+            _pending_runs.pop(task_id, None)
+
+    _pending_runs[task_id] = asyncio.create_task(_run())
 
     return TaskResponse(
-        task_id=runtime.state.task_id,
-        status="created",
+        task_id=task_id,
+        status="running",
         goal=request.goal,
-        message="Task created. Use GET /api/tasks/{task_id}/stream to follow progress.",
+        message="Task started. Connect SSE to follow progress.",
     )
 
 
