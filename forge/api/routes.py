@@ -6,6 +6,7 @@ and retrieving artifacts.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, AsyncIterator
 
@@ -90,6 +91,26 @@ async def list_tasks() -> TaskListResponse:
     return TaskListResponse(tasks=tasks_list)
 
 
+@router.get("/tasks/events")
+async def stream_all_events():
+    """SSE endpoint: stream ALL events in real-time (no task_id filter)."""
+    async def event_generator() -> AsyncIterator[str]:
+        async for event in event_bus.subscribe():
+            yield f"data: {event.serialize()}\n\n"
+            if event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED, EventKind.TASK_CANCELLED):
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/tasks/{task_id}", response_model=TaskStatusResponse)
 async def get_task(task_id: str) -> TaskStatusResponse:
     """Get task status by ID."""
@@ -109,12 +130,12 @@ async def get_task(task_id: str) -> TaskStatusResponse:
 
 @router.get("/tasks/{task_id}/events")
 async def stream_task_events(task_id: str):
-    """SSE endpoint: stream events for a task in real-time."""
+    """SSE endpoint: stream events for a specific task."""
     async def event_generator() -> AsyncIterator[str]:
         async for event in event_bus.subscribe():
             if event.task_id and event.task_id != task_id:
                 continue
-            yield f"event: {event.kind.value}\ndata: {event.serialize()}\n\n"
+            yield f"data: {event.serialize()}\n\n"
             if event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED, EventKind.TASK_CANCELLED):
                 break
 
@@ -138,6 +159,28 @@ async def approve_action(task_id: str, approved: bool = True) -> dict[str, Any]:
         task_id=task_id,
     ))
     return {"task_id": task_id, "approved": approved}
+
+
+_demo_task: asyncio.Task | None = None
+
+
+@router.post("/demo")
+async def trigger_demo() -> dict[str, Any]:
+    """Trigger the event replay demo in-process so SSE subscribers see the events."""
+    global _demo_task
+    if _demo_task and not _demo_task.done():
+        raise HTTPException(status_code=409, detail="Demo is already running")
+
+    from forge.demo.event_demo import replay_demo
+
+    async def _run():
+        try:
+            await replay_demo()
+        except Exception as e:
+            print(f"  [demo] Error: {e}")
+
+    _demo_task = asyncio.create_task(_run())
+    return {"status": "started", "message": "Demo replay started. Connect SSE to watch."}
 
 
 @router.get("/health")

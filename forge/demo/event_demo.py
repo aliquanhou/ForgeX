@@ -1,14 +1,17 @@
-"""Event Demo — replay a full task lifecycle for ForgeX-Studio testing.
+"""Event Demo -- replay a full task lifecycle for ForgeX-Studio testing.
 
 Simulates all 18 event types from the Event Protocol v1,
 replaying them through the EventBus so Studio receives them via SSE.
 
 Usage:
-    # Start ForgeX Runtime in one terminal:
+    # Start ForgeX Runtime:
     python -m forge.main
 
-    # In another terminal, replay the demo:
-    python -m forge.demo.event_demo
+    # Trigger demo replay (same process, events reach SSE subscribers):
+    curl -X POST http://localhost:8000/api/demo
+
+    # Or run standalone (no SSE delivery -- separate EventBus instance):
+    # python -m forge.demo.event_demo
 
     # Studio at http://localhost:5173 will show the full timeline.
 """
