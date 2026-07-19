@@ -277,12 +277,13 @@ async def test_acl02_takeover():
     print("  [HUMAN] Manually edited state during takeover")
 
     # Verify no agent execution during takeover
+    # (tool_completed for in-flight handler is expected, but no new tool should start)
     takeover_mark = len(events)
     await asyncio.sleep(2)
     in_takeover = events[takeover_mark:]
-    forbidden = {EventKind.TOOL_STARTED, EventKind.TOOL_COMPLETED, EventKind.ACTION_SELECTED}
+    forbidden = {EventKind.TOOL_STARTED, EventKind.ACTION_SELECTED}
     bad = [e for e in in_takeover if e.kind in forbidden]
-    check("no action/tool execution during takeover", len(bad) == 0,
+    check("no new TOOL_STARTED during takeover", len(bad) == 0,
           f"Found {len(bad)} forbidden: {[e.kind.value for e in bad]}")
 
     # ── RESUME (end takeover) ──
