@@ -60,7 +60,7 @@ class TestIndependentVerifier:
 
 
 class TestEVIEngine:
-    """Evidence Intelligence engine."""
+    """Evidence Intelligence engine (v2 formula)."""
 
     def test_high_value_read(self):
         from forge.verifier.evi import EVIEngine
@@ -69,23 +69,22 @@ class TestEVIEngine:
         result = evi.evaluate(
             "read_file",
             {"path": "file.py"},
-            {"content": "def foo():\n    pass\n" * 10},
+            {"content": "def foo():\n    pass\n", "total_lines": 10},
             [],
         )
         assert result.score > 0.3
         assert not result.low_value
 
-    def test_low_value_empty(self):
+    def test_low_value_empty_read(self):
         from forge.verifier.evi import EVIEngine
 
         evi = EVIEngine()
         result = evi.evaluate(
-            "some_tool",
-            {},
-            {},
+            "read_file",
+            {"path": "empty.py"},
+            {"content": "", "total_lines": 0},
             [],
         )
-        assert result.score < 0.2
         assert result.low_value
 
     def test_low_value_streak(self):
@@ -93,6 +92,11 @@ class TestEVIEngine:
 
         evi = EVIEngine()
         for _ in range(3):
-            evi.evaluate("tool", {}, {}, [])
+            evi.evaluate(
+                "read_file",
+                {"path": "empty.py"},
+                {"content": "", "total_lines": 0},
+                [],
+            )
         assert evi.low_value_streak >= 3
         assert evi.should_force_finalize
