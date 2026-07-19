@@ -109,7 +109,7 @@ async def create_task(request: TaskRequest) -> TaskResponse:
             track_tokens(resp)
             llm_response["result"] = resp.content
             state.add_fact(f"Result: {resp.content[:300]}")
-            await publish(EventKind.FACT_CONFIRMED, {"fact": resp.content[:500], "source": "llm", "confidence": 1.0, "is_final": True})
+            await publish(EventKind.FACT_CONFIRMED, {"fact": resp.content[:2000], "source": "llm", "confidence": 1.0, "is_final": True})
         except Exception as e:
             await publish(EventKind.FACT_CONFIRMED, {"fact": "Processing request... (LLM unavailable)", "source": "default", "confidence": 0.5})
 
