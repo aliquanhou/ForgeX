@@ -2,7 +2,7 @@
 
 **更新日期**: 2026-07-20  
 **当前版本**: v0.3.3 LTS（Autonomous Control Layer 闭环验证）  
-**测试总数**: 210 项，0 失败
+**测试总数**: 216 项，0 失败
 
 ### v0.3.3 LTS — Autonomous Control Layer（已验证）
 - [x] ACL-01: Pause/Resume 稳定性 — 30s 暂停，无工具执行（14/14 ✅）
@@ -10,13 +10,14 @@
 - [x] ACL-02 Real: 真实磁盘文件接管 — Agent 不覆盖人改（19/19 ✅）
 - [x] ACL-03: Rollback 回滚一致性（4/4 ✅）
 - [x] ACL-04: Mode 切换一致性（12/12 ✅）
-- [x] **88/88 断言全部通过，控制层形成稳定契约**
+- [x] ACL-05: Multi-Agent Isolation — 3 实例并发独立控制（19/19 ✅）
+- [x] ACL-06: Event Contract Integrity — 6 种控制动作事件链验证（40/40 ✅）
+- [x] **108/108 断言全部通过，控制层形成稳定契约**
 
 ### v0.3.4 规划：World Reconciliation Layer
 - [ ] Human 修改 → Agent 理解修改 → 调整计划 → 继续
 - [ ] `human_world_changed` 事件 + Impact 重算
-- [ ] ACL-05 Multi-Agent Isolation
-- [ ] ACL-06 Event Contract Integrity
+- [ ] Redirect 命令 — 保留 World Model 注入新约束
 
 ---
 

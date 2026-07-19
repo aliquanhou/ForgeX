@@ -73,7 +73,9 @@ Task
 | Real File Override | ✅ | 19/19 | 人机共享工作空间成立 |
 | Rollback | ✅ | 4/4 | 状态具备可逆能力 |
 | Mode Switching | ✅ | 12/12 | 自主/观察/治理模式稳定 |
-| **总计** | **✅** | **88/88** | **控制层形成稳定契约** |
+| Multi-Agent Isolation | ✅ | 19/19 | 3 实例并发，各自独立控制 |
+| Event Contract Integrity | ✅ | 40/40 | 6 种控制动作完整事件链 |
+| **总计** | **✅** | **108/108** | **控制层形成稳定契约** |
 
 ### 发现的 Runtime Bug
 
