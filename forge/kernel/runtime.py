@@ -67,6 +67,10 @@ class Runtime:
         )
         self.scheduler = Scheduler()
 
+        # v0.3.3 Autonomous Control Layer — pause event (non-busy-wait)
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # default: running
+
         # Plugin system for extensibility
         self._plugins: dict[str, Callable[..., Any]] = {}
 
@@ -106,6 +110,7 @@ class Runtime:
     async def pause(self) -> None:
         """Pause the runtime loop at the next safe point."""
         self.state.paused = True
+        self._pause_event.clear()
         await event_bus.publish(Event(
             kind=EventKind.RUNTIME_PAUSED,
             payload={"task_id": self.state.task_id},
@@ -115,6 +120,7 @@ class Runtime:
     async def resume(self) -> None:
         """Resume from pause."""
         self.state.paused = False
+        self._pause_event.set()
         if self.state.human_override:
             self.state.human_override = False
             await event_bus.publish(Event(
@@ -242,8 +248,7 @@ class Runtime:
                 # 0. Check pause/stop (v0.3.3 Autonomous Control Layer)
                 if self.state.phase == TaskPhase.CANCELLED:
                     break
-                while self.state.paused:
-                    await asyncio.sleep(0.5)
+                await self._pause_event.wait()  # non-busy-wait gate
 
                 # 1. Check budgets
                 if self.budget.is_exhausted:
