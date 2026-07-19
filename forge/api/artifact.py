@@ -10,6 +10,7 @@ No more "write_file → done". Now it's:
 from __future__ import annotations
 
 import hashlib
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,25 +22,12 @@ class ArtifactState(str, Enum):
     """Lifecycle states for an artifact."""
 
     DRAFT = "draft"
-    """Being created, not yet ready."""
-
     GENERATED = "generated"
-    """Content has been written to disk."""
-
     VALIDATED = "validated"
-    """Passed automated verification (syntax check, min size, etc.)."""
-
     APPROVED = "approved"
-    """User (or auto-approve policy) has signed off."""
-
     COMMITTED = "committed"
-    """Persisted to version control (git commit)."""
-
     ARCHIVED = "archived"
-    """No longer active, preserved for history."""
-
     FAILED = "failed"
-    """Lifecycle terminated due to error."""
 
 
 # Valid transitions
@@ -69,6 +57,12 @@ class LifecycleArtifact:
     validated_at: str = ""
     committed_at: str = ""
     error: str = ""
+
+    # v0.3: Versioning
+    version: int = 1
+    parent_id: str = ""  # previous version's artifact ID
+    diff_from_parent: str = ""  # diff against parent
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def transition(self, to: ArtifactState) -> None:
@@ -91,11 +85,87 @@ class LifecycleArtifact:
 
 
 class ArtifactCommitter:
-    """Ensures artifacts go through proper lifecycle with delivery guarantees."""
+    """Ensures artifacts go through proper lifecycle with delivery guarantees.
+
+    v0.3: Versioning support — every artifact can have a version chain.
+    """
 
     def __init__(self, workspace_dir: str = "") -> None:
         self._workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd()
         self._lifecycle_hooks: dict[ArtifactState, list[Callable[[LifecycleArtifact], Awaitable[None]]]] = {}
+        self._version_index: dict[str, list[LifecycleArtifact]] = {}  # path → version list
+
+    def _get_next_version(self, path: str) -> tuple[int, str]:
+        """Get next version number and parent ID for a path."""
+        normalized = str(Path(path).resolve())
+        versions = self._version_index.get(normalized, [])
+        if not versions:
+            return (1, "")
+        latest = versions[-1]
+        return (latest.version + 1, latest.id)
+
+    async def create_version(
+        self,
+        artifact_id: str,
+        kind: str,
+        path: str,
+        content: str,
+        original_content: str = "",
+    ) -> LifecycleArtifact:
+        """Create a new version of an artifact linked to its parent."""
+        version, parent_id = self._get_next_version(path)
+
+        diff = ""
+        if original_content:
+            import difflib
+            diff = "".join(difflib.unified_diff(
+                original_content.splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile=path + " (v{})".format(version - 1),
+                tofile=path + " (v{})".format(version),
+            ))
+
+        artifact = await self.generate(artifact_id, kind, path, content)
+        artifact.version = version
+        artifact.parent_id = parent_id
+        artifact.diff_from_parent = diff
+
+        # Index
+        normalized = str(Path(path).resolve())
+        if normalized not in self._version_index:
+            self._version_index[normalized] = []
+        self._version_index[normalized].append(artifact)
+
+        return artifact
+
+    def get_version_history(self, path: str) -> list[LifecycleArtifact]:
+        """Get all versions of an artifact."""
+        normalized = str(Path(path).resolve())
+        return list(self._version_index.get(normalized, []))
+
+    async def rollback_to(self, path: str, version: int) -> LifecycleArtifact | None:
+        """Rollback an artifact to a previous version.
+
+        Creates a NEW version with the old content (doesn't destroy history).
+        """
+        versions = self.get_version_history(path)
+        target = next((v for v in versions if v.version == version), None)
+        if target is None:
+            return None
+
+        # Create new version with old content
+        new_id = uuid.uuid4().hex[:12]
+        return await self.create_version(
+            new_id,
+            target.kind,
+            path,
+            target.content,
+            original_content=versions[-1].content if versions else "",
+        )
+
+    @property
+    def total_versions(self) -> int:
+        return sum(len(v) for v in self._version_index.values())
 
     def on_state(self, state: ArtifactState, handler: Callable[[LifecycleArtifact], Awaitable[None]]) -> None:
         """Register a handler that fires when artifact reaches a state."""

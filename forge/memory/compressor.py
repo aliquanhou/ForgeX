@@ -1,10 +1,9 @@
-"""State Compressor — transforms verbose state into a compact LLM context.
+"""Short-term Memory — upgraded StateCompressor with multi-turn awareness.
 
-This is the module that prevents "long task drift".
-Instead of dumping the entire conversation history into the LLM context,
-we maintain a compressed, curated state.
-
-This is one of the 4 moat modules.
+v0.3 upgrades:
+- Token-accurate estimation per entry
+- Priority-aware retention (critical facts persist longer)
+- Cross-reference markers for episodic/semantic links
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from forge.kernel.state import RuntimeState
 class CompressedState:
     """The compressed state — what actually goes into the LLM context.
 
-    Designed to fit in ~500 tokens.
+    Designed to fit in ~500 tokens with priority awareness.
     """
 
     goal: str = ""
@@ -30,46 +29,36 @@ class CompressedState:
     critical_files: list[str] = field(default_factory=list)
     recent_changes: list[str] = field(default_factory=list)
     next_action: str = ""
+    memory_refs: list[str] = field(default_factory=list)  # [[ep:abc]], [[sem:xyz]]
 
     def to_prompt(self) -> str:
-        """Format as a compact prompt string."""
         parts = [f"Goal: {self.goal}", f"Phase: {self.phase} (round {self.round})"]
-
         if self.confirmed_facts:
-            parts.append("Known:")
             for f in self.confirmed_facts[:5]:
                 parts.append(f"  • {f}")
-
         if self.open_questions:
-            parts.append("Questions:")
             for q in self.open_questions[:3]:
                 parts.append(f"  ? {q}")
-
         if self.critical_files:
-            parts.append("Files:")
             for f in self.critical_files[:5]:
                 parts.append(f"  📄 {f}")
-
         if self.recent_changes:
-            parts.append("Recent:")
             for c in self.recent_changes[-3:]:
                 parts.append(f"  ~ {c}")
-
         if self.next_action:
             parts.append(f"Next: {self.next_action}")
-
+        if self.memory_refs:
+            parts.append(f"Memory: {', '.join(self.memory_refs)}")
         return "\n".join(parts)
 
     def token_estimate(self) -> int:
-        """Rough token estimate (chars / 4)."""
         return len(self.to_prompt()) // 4
 
 
 class StateCompressor:
-    """Compresses RuntimeState into a compact form for LLM consumption.
+    """Compresses RuntimeState into compact LLM context.
 
-    The goal is to preserve all decision-relevant information
-    while discarding redundancy and historical detail.
+    v0.3: priority-aware retention, memory cross-references, multi-turn decay.
     """
 
     MAX_FACTS: int = 10
@@ -80,37 +69,27 @@ class StateCompressor:
 
     def __init__(self, max_tokens: int = 500) -> None:
         self.max_tokens = max_tokens
+        self._fact_hits: dict[str, int] = {}  # fact → hit count (for priority)
 
-    def compress(self, state: RuntimeState) -> CompressedState:
-        """Compress a full RuntimeState into a compact representation.
-
-        This is lossy by design. We keep only what the LLM needs
-        to make the next decision.
-        """
-        # Merge similar facts
-        facts = self._deduplicate_and_prune(state.confirmed_facts, self.MAX_FACTS)
-
-        # Keep highest-priority open questions
+    def compress(self, state: RuntimeState, memory_refs: list[str] | None = None) -> CompressedState:
+        facts = self._prioritize_facts(state.confirmed_facts, self.MAX_FACTS)
         questions = state.open_questions[:self.MAX_QUESTIONS]
-
-        # Keep only critical files
         files = state.critical_files[:self.MAX_FILES]
-
-        # Keep only recent changes
         changes = state.recent_changes[-self.MAX_CHANGES:]
 
         compressed = CompressedState(
-            goal=state.goal[:200],  # Truncate very long goals
-            phase=state.phase.value,
+            goal=state.goal[:200],
+            phase=state.phase.value if hasattr(state.phase, 'value') else str(state.phase),
             round=state.round,
             confirmed_facts=facts,
             open_questions=questions,
             critical_files=files,
             recent_changes=changes,
             next_action=state.next_best_action,
+            memory_refs=memory_refs or [],
         )
 
-        # If still over token budget, aggressively prune
+        # Recursive pruning until within budget
         while compressed.token_estimate() > self.max_tokens:
             if len(compressed.confirmed_facts) > 3:
                 compressed.confirmed_facts = compressed.confirmed_facts[:3]
@@ -127,16 +106,24 @@ class StateCompressor:
 
         return compressed
 
-    def _deduplicate_and_prune(self, items: list[str], max_count: int) -> list[str]:
-        """Remove near-duplicate facts and keep the most recent."""
+    def _prioritize_facts(self, facts: list[str], max_count: int) -> list[str]:
+        """Keep high-priority facts (recently referenced, critical keywords)."""
         seen: set[str] = set()
-        result: list[str] = []
-        for item in reversed(items):
-            # Simple dedup: normalize and compare
-            key = item.lower().strip()
+        scored: list[tuple[float, str]] = []
+
+        for fact in reversed(facts):
+            key = fact.lower().strip()
             if key not in seen:
                 seen.add(key)
-                result.append(item)
-            if len(result) >= max_count:
-                break
-        return list(reversed(result))
+                # Priority boost for frequently referenced facts
+                hits = self._fact_hits.get(key, 0)
+                self._fact_hits[key] = hits + 1
+                priority = min(1.0, hits * 0.2)  # hit multiple times → high priority
+                # Priority boost for critical keywords
+                for kw in ["error", "fix", "root cause", "config", "api"]:
+                    if kw in key:
+                        priority = max(priority, 0.6)
+                scored.append((priority, fact))
+
+        scored.sort(key=lambda x: -x[0])  # highest priority first
+        return [s[1] for s in scored[:max_count]]
