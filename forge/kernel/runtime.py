@@ -308,7 +308,7 @@ class Runtime:
             payload={
                 "phase": self.state.phase.value,
                 "rounds": self.state.round,
-                "tokens_used": self.state.total_tokens_used,
+                "tokens_used": self.state.total_tokens_used or self.budget.get_state(BudgetKind.TOKENS).used,
                 "elapsed_seconds": elapsed,
             },
             task_id=self.state.task_id,
@@ -365,10 +365,21 @@ class Runtime:
                 task_id=tid,
             ))
 
-        # Publish tool started
+        # Publish tool started — use phase-aware display name
+        phase_label = new_phase.value if new_phase else original_phase.value if hasattr(original_phase, 'value') else str(original_phase)
+        display_name = {
+            "plan": "🧠 规划",
+            "explore": "🔍 分析",
+            "implement": "⚡ 执行",
+            "verify": "✓ 验证",
+            "finalize": "📦 收尾",
+            "recover": "🔄 恢复",
+            "stop": "⏹ 停止",
+        }.get(action_name, action_name)
         await event_bus.publish(Event(
             kind=EventKind.TOOL_STARTED,
-            payload={"tool": action_name, "target": self.state.goal[:60], "params": {}},
+            payload={"tool": action_name, "display_name": display_name, "phase": phase_label,
+                     "target": self.state.goal[:60], "params": {}},
             task_id=tid,
         ))
 

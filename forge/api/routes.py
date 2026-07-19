@@ -70,62 +70,53 @@ async def create_task(request: TaskRequest) -> TaskResponse:
     # ── Register default handlers so tasks produce meaningful output ──
     from forge.llm.client import LLMClient
     from forge.config import config
+    from forge.kernel.event_bus import Event, EventKind
     llm = LLMClient(
         api_key=config.llm_api_key,
         base_url=config.llm_base_url,
         default_model=config.llm_model,
     )
-    # Cache LLM response per task so handlers share it
     llm_response: dict[str, str] = {}
+
+    async def publish(kind: EventKind, payload: dict):
+        await event_bus.publish(Event(kind=kind, payload=payload, task_id=task_id))
+
+    def track_tokens(resp):
+        """Record LLM token usage into runtime state and budget."""
+        tokens = (resp.tokens_in or 0) + (resp.tokens_out or 0)
+        if tokens:
+            runtime.state.total_tokens_used += tokens
+            runtime.budget.consume_tokens(tokens)
 
     async def plan_handler(state):
         goal = state.goal
-        state.add_fact(f"Planning for: {goal}")
-        state.current_plan = f"1. Understand request\n2. Analyze context\n3. Generate response"
-        # Try LLM for plan
-        try:
-            resp = await llm.chat(
-                f"You are ForgeX Agent OS. User request: {goal}\n\nProvide a brief 1-3 sentence plan.",
-                system="You are an AI engineering assistant. Be concise.",
-                max_tokens=300,
-            )
-            llm_response["plan"] = resp.content
-            state.add_fact(f"Plan: {resp.content[:200]}")
-        except Exception:
-            state.add_fact("Plan: analyze and respond to user request")
+        state.current_plan = "1. Understand request\n2. Analyze context\n3. Generate response"
+        await publish(EventKind.FACT_CONFIRMED, {"fact": f"Planning for: {goal}", "source": "scheduler", "confidence": 1.0})
+        state.add_fact(f"Plan: analyze and respond to: {goal[:80]}")
 
     async def explore_handler(state):
-        state.add_fact(f"Analyzing request: {state.goal[:100]}")
-        try:
-            if "plan" in llm_response:
-                resp = await llm.chat(
-                    f"Based on this plan: {llm_response['plan'][:200]}\n\nWhat key information do you need to fulfill the user request: {state.goal}",
-                    system="You are a thorough engineering analyst.",
-                    max_tokens=400,
-                )
-                llm_response["explore"] = resp.content
-                state.add_fact(f"Analysis: {resp.content[:200]}")
-        except Exception:
-            state.add_fact(f"Exploring: {state.goal}")
-        state.add_change(f"Round {state.round}: analysis")
+        await publish(EventKind.FACT_CONFIRMED, {"fact": f"Analyzing: {state.goal[:80]}", "source": "scheduler", "confidence": 1.0})
+        state.add_fact(f"Exploring request: {state.goal[:80]}")
 
     async def implement_handler(state):
+        """Single LLM call — generate the actual response."""
         try:
-            context = llm_response.get("explore", "") or llm_response.get("plan", "") or state.goal
             resp = await llm.chat(
-                f"Based on analysis: {context[:300]}\n\nProvide a helpful response to the user request: {state.goal}",
-                system="You are ForgeX Agent OS, an AI engineering assistant. Provide clear, actionable responses.",
-                max_tokens=800,
+                f"User request: {state.goal}\n\nProvide a complete, helpful response. Be concise and direct.",
+                system="You are ForgeX Agent OS, an AI engineering assistant. Be concise, practical, and thorough.",
+                max_tokens=1000,
             )
+            track_tokens(resp)
             llm_response["result"] = resp.content
-            state.add_fact(f"Result: {resp.content[:200]}")
-        except Exception:
-            state.add_fact(f"Processing: {state.goal[:80]}")
-        state.add_change(f"Round {state.round}: implementation")
+            state.add_fact(f"Result: {resp.content[:300]}")
+            await publish(EventKind.FACT_CONFIRMED, {"fact": resp.content[:500], "source": "llm", "confidence": 1.0, "is_final": True})
+        except Exception as e:
+            await publish(EventKind.FACT_CONFIRMED, {"fact": "Processing request... (LLM unavailable)", "source": "default", "confidence": 0.5})
 
     async def verify_handler(state):
         if "result" in llm_response:
             state.add_fact("Response generated successfully")
+            await publish(EventKind.FACT_CONFIRMED, {"fact": "Response generated successfully", "source": "verifier", "confidence": 1.0})
         else:
             state.add_fact("Task completed")
 
