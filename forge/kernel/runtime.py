@@ -20,6 +20,17 @@ from .event_bus import Event, EventKind, event_bus
 from .budget import BudgetManager, BudgetKind
 from .scheduler import Scheduler, ScheduleAction, ScheduleDecision
 
+# Map ScheduleAction -> TaskPhase for event publishing
+_ACTION_PHASE_MAP: dict[ScheduleAction, TaskPhase] = {
+    ScheduleAction.PLAN: TaskPhase.PLANNING,
+    ScheduleAction.EXPLORE: TaskPhase.EXPLORATION,
+    ScheduleAction.IMPLEMENT: TaskPhase.IMPLEMENTATION,
+    ScheduleAction.VERIFY: TaskPhase.VERIFICATION,
+    ScheduleAction.FINALIZE: TaskPhase.FINALIZING,
+    ScheduleAction.RECOVER: TaskPhase.RECOVERY,
+    ScheduleAction.STOP: TaskPhase.CANCELLED,
+}
+
 
 @dataclass
 class RuntimeResult:
@@ -96,8 +107,9 @@ class Runtime:
         """Execute a goal through the runtime loop."""
         start_time = datetime.now(timezone.utc)
 
-        # Initialize state
-        self.state = RuntimeState()
+        # Initialize state only if not already set (preserves task_id from API)
+        if not self.state.goal:
+            self.state = RuntimeState()
         self.state.goal = goal
         self.state.phase = TaskPhase.INIT
         if session_id:
@@ -227,74 +239,108 @@ class Runtime:
             return None
 
     async def _execute_action(self, decision: ScheduleDecision) -> None:
-        """Execute a single schedule action by dispatching to the right handler.
-
-        After the handler completes, auto-advance to the next phase
-        UNLESS the handler already changed the phase.
-        """
+        """Execute a single schedule action, emitting events for each step."""
         action = decision.action
-
-        # Set phase before calling handler, but save original for auto-advance
+        tid = self.state.task_id
         original_phase = self.state.phase
+        action_name = action.value if hasattr(action, 'value') else str(action)
+        start_ts = datetime.now(timezone.utc)
 
-        if action == ScheduleAction.PLAN:
-            self.state.phase = TaskPhase.PLANNING
-            if self._plan_handler:
-                await self._plan_handler(self.state)
-            else:
-                self.state.add_fact("No plan handler registered; using default plan.")
+        # Publish phase change
+        new_phase = _ACTION_PHASE_MAP.get(action)
+        if new_phase and self.state.phase != new_phase:
+            prev = self.state.phase.value if hasattr(self.state.phase, 'value') else str(self.state.phase)
+            self.state.phase = new_phase
+            await event_bus.publish(Event(
+                kind=EventKind.PHASE_CHANGED,
+                payload={"from": prev, "to": new_phase.value},
+                task_id=tid,
+            ))
 
-        elif action == ScheduleAction.EXPLORE:
-            self.state.phase = TaskPhase.EXPLORATION
-            if self._explore_handler:
-                await self._explore_handler(self.state)
-            else:
-                self.state.add_fact("No explore handler registered.")
+        # Publish tool started
+        await event_bus.publish(Event(
+            kind=EventKind.TOOL_STARTED,
+            payload={"tool": action_name, "target": self.state.goal[:60], "params": {}},
+            task_id=tid,
+        ))
 
-        elif action == ScheduleAction.IMPLEMENT:
-            self.state.phase = TaskPhase.IMPLEMENTATION
-            if self._implement_handler:
-                await self._implement_handler(self.state)
-            else:
-                self.state.add_fact("No implement handler registered.")
+        # Execute
+        error = None
+        try:
+            if action == ScheduleAction.PLAN:
+                if self._plan_handler:
+                    await self._plan_handler(self.state)
+                else:
+                    self.state.add_fact("No plan handler registered; using default plan.")
 
-        elif action == ScheduleAction.VERIFY:
-            self.state.phase = TaskPhase.VERIFICATION
-            if self._verify_handler:
-                await self._verify_handler(self.state)
-            else:
+            elif action == ScheduleAction.EXPLORE:
+                if self._explore_handler:
+                    await self._explore_handler(self.state)
+                else:
+                    self.state.add_fact("No explore handler registered.")
+
+            elif action == ScheduleAction.IMPLEMENT:
+                if self._implement_handler:
+                    await self._implement_handler(self.state)
+                else:
+                    self.state.add_fact("No implement handler registered.")
+
+            elif action == ScheduleAction.VERIFY:
+                if self._verify_handler:
+                    await self._verify_handler(self.state)
+                else:
+                    self.state.phase = TaskPhase.COMPLETED
+
+            elif action == ScheduleAction.FINALIZE:
+                self.state.phase = TaskPhase.FINALIZING
+                if self._finalize_handler:
+                    await self._finalize_handler(self.state)
                 self.state.phase = TaskPhase.COMPLETED
 
-        elif action == ScheduleAction.FINALIZE:
-            self.state.phase = TaskPhase.FINALIZING
-            if self._finalize_handler:
-                await self._finalize_handler(self.state)
-            self.state.phase = TaskPhase.COMPLETED
+            elif action == ScheduleAction.ASK_USER:
+                pass
 
-        elif action == ScheduleAction.ASK_USER:
-            pass
+            elif action == ScheduleAction.RECOVER:
+                self.state.phase = TaskPhase.RECOVERY
+                if self._recover_handler:
+                    await self._recover_handler(self.state)
 
-        elif action == ScheduleAction.RECOVER:
-            self.state.phase = TaskPhase.RECOVERY
-            if self._recover_handler:
-                await self._recover_handler(self.state)
+            elif action == ScheduleAction.STOP:
+                if self.state.phase not in (TaskPhase.COMPLETED, TaskPhase.FAILED):
+                    self.state.phase = TaskPhase.CANCELLED
 
-        elif action == ScheduleAction.STOP:
-            if self.state.phase not in (TaskPhase.COMPLETED, TaskPhase.FAILED):
-                self.state.phase = TaskPhase.CANCELLED
+            # Auto-advance phase
+            if self.state.phase == original_phase and action not in (
+                ScheduleAction.STOP, ScheduleAction.WAIT, ScheduleAction.ASK_USER,
+            ):
+                next_p = self._next_phase()
+                if next_p and next_p != self.state.phase:
+                    prev = self.state.phase.value if hasattr(self.state.phase, 'value') else str(self.state.phase)
+                    self.state.phase = next_p
+                    await event_bus.publish(Event(
+                        kind=EventKind.PHASE_CHANGED,
+                        payload={"from": prev, "to": next_p.value},
+                        task_id=tid,
+                    ))
 
-        # Auto-advance phase: if the handler didn't change phase,
-        # move to next phase in sequence
-        if self.state.phase == original_phase and action not in (
-            ScheduleAction.STOP,
-            ScheduleAction.WAIT,
-            ScheduleAction.ASK_USER,
-        ):
-            next_p = self._next_phase()
-            if next_p and next_p != self.state.phase:
-                self.state.phase = next_p
-                await event_bus.publish(Event(
-                    kind=EventKind.PHASE_CHANGED,
-                    payload={"from": original_phase.value, "to": next_p.value},
-                    task_id=self.state.task_id,
-                ))
+        except Exception as e:
+            error = str(e)
+            await event_bus.publish(Event(
+                kind=EventKind.ERROR,
+                payload={"error": error, "source": action_name, "recoverable": False},
+                task_id=tid,
+            ))
+
+        # Publish tool completed
+        elapsed_ms = (datetime.now(timezone.utc) - start_ts).total_seconds() * 1000
+        await event_bus.publish(Event(
+            kind=EventKind.TOOL_COMPLETED,
+            payload={
+                "tool": action_name,
+                "target": self.state.goal[:60],
+                "duration_ms": elapsed_ms,
+                "error": error or "",
+                "result_summary": f"Action '{action_name}' -> phase={self.state.phase.value}",
+            },
+            task_id=tid,
+        ))
