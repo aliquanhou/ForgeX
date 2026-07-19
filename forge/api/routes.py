@@ -99,7 +99,7 @@ async def create_task(request: TaskRequest) -> TaskResponse:
         state.add_fact(f"Exploring request: {state.goal[:80]}")
 
     async def implement_handler(state):
-        """Single LLM call — generate the actual response."""
+        """Single LLM call — emit response progressively in chunks."""
         try:
             resp = await llm.chat(
                 f"User request: {state.goal}\n\nProvide a complete, helpful response. Be concise and direct.",
@@ -109,7 +109,23 @@ async def create_task(request: TaskRequest) -> TaskResponse:
             track_tokens(resp)
             llm_response["result"] = resp.content
             state.add_fact(f"Result: {resp.content[:300]}")
-            await publish(EventKind.FACT_CONFIRMED, {"fact": resp.content[:2000], "source": "llm", "confidence": 1.0, "is_final": True})
+            # Emit progressively — split into chunks for streaming feel
+            full = resp.content
+            chunk_size = 80
+            emitted = ""
+            for i in range(0, len(full), chunk_size):
+                chunk = full[i:i+chunk_size]
+                emitted += chunk
+                is_last = i + chunk_size >= len(full)
+                await publish(EventKind.FACT_CONFIRMED, {
+                    "fact": emitted,
+                    "source": "llm",
+                    "confidence": 1.0,
+                    "is_final": is_last,
+                    "is_streaming": not is_last,
+                })
+                if not is_last:
+                    await asyncio.sleep(0.15)
         except Exception as e:
             await publish(EventKind.FACT_CONFIRMED, {"fact": "Processing request... (LLM unavailable)", "source": "default", "confidence": 0.5})
 
