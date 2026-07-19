@@ -555,15 +555,25 @@ async def test_acl05_multi_agent_isolation():
 
     # ── Collector: tag events by task_id ──
     all_events: list[Event] = []
+    target_tids: set[str] = set()
 
     async def collector():
-        async for ev in event_bus.subscribe():
-            all_events.append(ev)
-            # Count how many agents completed
-            completed_tasks = {e.task_id for e in all_events
-                               if e.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED)}
-            if len(completed_tasks) >= 3:
-                break
+        q = asyncio.Queue(maxsize=256)
+        event_bus._subscribers.add(q)
+        completed_seen: set[str] = set()
+        try:
+            while len(completed_seen) < 3:
+                ev = await asyncio.wait_for(q.get(), timeout=60)
+                all_events.append(ev)
+                q.task_done()
+                if ev.task_id:
+                    target_tids.add(ev.task_id)
+                if ev.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
+                    completed_seen.add(ev.task_id)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            event_bus._subscribers.discard(q)
 
     collector_task = asyncio.create_task(collector())
 
@@ -607,6 +617,12 @@ async def test_acl05_multi_agent_isolation():
     c_result = await agents[2].rollback()
     check("C rollback returned (no crash)", isinstance(c_result, dict))
 
+    # ── Resume Agent A so it can complete ──
+    print("  [A] Resuming Agent A...")
+    await agents[0].resume()
+    await asyncio.sleep(0)
+    check("A resumed: state.paused=False", agents[0].state.paused is False)
+
     # ── Verify isolation: each agent's round is independent ──
     rounds = [rt.state.round for rt in agents]
     # All should have advanced at least somewhat (but independently)
@@ -628,27 +644,34 @@ async def test_acl05_multi_agent_isolation():
     await collector_task
 
     # ── Event isolation checks ──
-    task_ids = {rt.state.task_id for rt in agents}
-    check("3 unique task_ids across agents", len(task_ids) == 3,
-          f"ids={task_ids}")
+    # Filter to only events from our 3 agents' task_ids
+    agent_tids = {rt.state.task_id for rt in agents}
+    check("3 unique task_ids across agents", len(agent_tids) == 3,
+          f"ids={agent_tids}")
 
-    # Count events per task_id
+    # Keep only events belonging to our 3 agents
+    owned_events = [e for e in all_events if e.task_id in agent_tids]
+
     for i, rt in enumerate(agents):
         tid = rt.state.task_id
-        ev_count = sum(1 for e in all_events if e.task_id == tid)
+        ev_count = sum(1 for e in owned_events if e.task_id == tid)
         check(f"Agent {i} has events by task_id ({ev_count})",
               ev_count > 0, f"tid={tid}")
 
     # Check that runtime_paused from A doesn't affect B/C
-    for tid in task_ids:
-        paused_events = [e for e in all_events
-                         if e.kind == EventKind.RUNTIME_PAUSED and e.task_id == tid]
-        if tid == agents[0].state.task_id:
-            check(f"Agent A has RUNTIME_PAUSED events", len(paused_events) >= 1)
-        else:
-            check(f"Agent B/C NOT affected by A pause (no RUNTIME_PAUSED for {tid[:8]}...)",
-                  len(paused_events) == 0,
-                  f"Found {len(paused_events)} pause events for non-A agent")
+    # Agent B was also paused deliberately, so it has its own RUNTIME_PAUSED
+    # Agent C was NOT paused — verify it has zero RUNTIME_PAUSED events
+    for i, rt in enumerate(agents):
+        tid = rt.state.task_id
+        paused_count = sum(1 for e in owned_events
+                           if e.kind == EventKind.RUNTIME_PAUSED and e.task_id == tid)
+        if i == 0:
+            check(f"Agent A has RUNTIME_PAUSED (paused on purpose)", paused_count >= 1,
+                  f"count={paused_count}")
+        elif i == 2:
+            check(f"Agent C NOT affected by A/B pause (no RUNTIME_PAUSED)",
+                  paused_count == 0,
+                  f"Found {paused_count} pause events for C")
 
     # ── Final state check ──
     for i, rt in enumerate(agents):
@@ -697,14 +720,28 @@ async def test_acl06_event_contract():
     rt.on_implement(med)
 
     all_events: list[Event] = []
-    completed = asyncio.Event()
 
     async def collector():
-        async for ev in event_bus.subscribe():
-            all_events.append(ev)
-            if ev.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
-                completed.set()
-                break
+        q = asyncio.Queue(maxsize=256)
+        event_bus._subscribers.add(q)
+        try:
+            while True:
+                ev = await asyncio.wait_for(q.get(), timeout=30)
+                all_events.append(ev)
+                q.task_done()
+                if ev.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
+                    # Still alive for 3 more seconds to collect post-completion events
+                    try:
+                        while True:
+                            ev2 = await asyncio.wait_for(q.get(), timeout=3)
+                            all_events.append(ev2)
+                            q.task_done()
+                    except asyncio.TimeoutError:
+                        break
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            event_bus._subscribers.discard(q)
 
     collector_task = asyncio.create_task(collector())
     run_task = asyncio.create_task(rt.run("acl-06 event contract"))
@@ -929,9 +966,10 @@ async def test_acl06_event_contract():
     ]
     for action, event, state_change in control_map:
         kind_list = [e.kind.value for e in all_events + events2]
-        ok = any(event.split("+")[0] in k for k in kind_list)
-        status = "✅" if ok else "⬜"
-        print(f"  {status} {action:24s} {event:30s} {state_change}")
+        event_key = event.split("+")[0]
+        ok = any(event_key.lower() in k for k in kind_list)
+        status = "[OK]" if ok else "[--]"
+        print(f"  {status:5s} {action:24s} {event:30s} {state_change}")
 
     print(f"\n  Total events (Instance 1): {len(all_events)}")
     print(f"  Total events (Instance 2): {len(events2)}")
