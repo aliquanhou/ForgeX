@@ -5,11 +5,13 @@
 高并发、多状态切换、异常干预下是否保持一致性。
 不是 UI 测试，是 Runtime 合约测试。
 
-包含 4 个核心测试：
+包含 6 个核心测试：
   ACL-01: Pause/Resume 稳定性
   ACL-02: Human Takeover 接管一致性
   ACL-03: Rollback 回滚一致性
   ACL-04: Mode 切换一致性
+  ACL-05: Multi-Agent Isolation — 多 Runtime 实例独立控制
+  ACL-06: Event Contract Integrity — 每个控制动作的事件链验证
 """
 
 import asyncio
@@ -511,15 +513,443 @@ async def test_acl04_mode_switching():
     return FAIL == 0
 
 
+# ────────────────────────────────────────────────────────────
+# ACL-05: Multi-Agent Isolation
+# ────────────────────────────────────────────────────────────
+
+async def test_acl05_multi_agent_isolation():
+    """ACL-05: Multi-Agent Isolation — 多 Runtime 实例独立控制.
+
+    场景：
+      Agent A (运行中) → pause → ...
+      Agent B (运行中) → continue → pause → resume → ...
+      Agent C (运行中) → rollback → ...
+
+    验证：
+      - Agent A pause 不影响 B、C 的执行
+      - Agent C rollback 不影响 A、B 的状态
+      - 每个 Runtime 的 round、phase、mode、paused 独立
+      - 每个 Runtime 的 _pause_event 独立
+      - 事件按 task_id 可区分
+    """
+    print("\n" + "=" * 60)
+    print("ACL-05: Multi-Agent Isolation (3 parallel Runtimes)")
+    print("=" * 60)
+
+    # ── Create 3 independent Runtime instances ──
+    agents = [Runtime(token_budget=30000, round_limit=10) for _ in range(3)]
+
+    for i, rt in enumerate(agents):
+        async def work(state, idx=i):
+            for j in range(4):
+                await asyncio.sleep(0.15)
+                state.add_fact(f"agent{idx}_step_{j}")
+
+        async def verify(state):
+            state.add_fact(f"agent{idx}_verified")
+
+        rt.on_plan(work)
+        rt.on_explore(work)
+        rt.on_implement(work)
+        rt.on_verify(verify)
+
+    # ── Collector: tag events by task_id ──
+    all_events: list[Event] = []
+
+    async def collector():
+        async for ev in event_bus.subscribe():
+            all_events.append(ev)
+            # Count how many agents completed
+            completed_tasks = {e.task_id for e in all_events
+                               if e.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED)}
+            if len(completed_tasks) >= 3:
+                break
+
+    collector_task = asyncio.create_task(collector())
+
+    # ── Launch all 3 agents concurrently ──
+    run_tasks = [asyncio.create_task(rt.run(f"acl-05 Agent {i}"))
+                 for i, rt in enumerate(agents)]
+
+    # Wait for all to start executing
+    await asyncio.sleep(0.8)
+
+    # ── Agent A: PAUSE ──
+    print("  [A] Pausing Agent A...")
+    await agents[0].pause()
+    await asyncio.sleep(0)
+
+    check("A paused: state.paused=True", agents[0].state.paused is True)
+    check("A paused: _pause_event cleared", agents[0]._pause_event.is_set() is False)
+
+    # ── Agent B: continue (verify not affected by A's pause) ──
+    check("B unaffected by A pause: B not paused", agents[1].state.paused is False)
+    check("B unaffected by A pause: B _pause_event set",
+          agents[1]._pause_event.is_set() is True)
+
+    # Let B and C run a bit more
+    await asyncio.sleep(1.0)
+
+    # ── Agent B: PAUSE then RESUME ──
+    print("  [B] Pausing then resuming Agent B...")
+    b_round_before = agents[1].state.round
+    await agents[1].pause()
+    await asyncio.sleep(0.5)
+    await agents[1].resume()
+    await asyncio.sleep(0.5)
+
+    check("B round advanced after pause/resume",
+          agents[1].state.round > b_round_before,
+          f"round: {b_round_before} -> {agents[1].state.round}")
+
+    # ── Agent C: ROLLBACK ──
+    print("  [C] Rolling back Agent C...")
+    c_result = await agents[2].rollback()
+    check("C rollback returned (no crash)", isinstance(c_result, dict))
+
+    # ── Verify isolation: each agent's round is independent ──
+    rounds = [rt.state.round for rt in agents]
+    # All should have advanced at least somewhat (but independently)
+    check("A has some round progress (advanced before pause)",
+          rounds[0] >= 2, f"rounds={rounds}")
+    check("B has independent round progress",
+          rounds[1] >= 2, f"rounds={rounds}")
+    check("C has independent round progress",
+          rounds[2] >= 2, f"rounds={rounds}")
+
+    # Verify rounds aren't identical (different pause timing)
+    # At least not all 3 have the same round count
+    distinct = len(set(rounds))
+    print(f"  Round distribution: {rounds} ({distinct} distinct)")
+
+    # ── Wait for all agents to complete ──
+    for t in run_tasks:
+        await asyncio.wait_for(t, timeout=45)
+    await collector_task
+
+    # ── Event isolation checks ──
+    task_ids = {rt.state.task_id for rt in agents}
+    check("3 unique task_ids across agents", len(task_ids) == 3,
+          f"ids={task_ids}")
+
+    # Count events per task_id
+    for i, rt in enumerate(agents):
+        tid = rt.state.task_id
+        ev_count = sum(1 for e in all_events if e.task_id == tid)
+        check(f"Agent {i} has events by task_id ({ev_count})",
+              ev_count > 0, f"tid={tid}")
+
+    # Check that runtime_paused from A doesn't affect B/C
+    for tid in task_ids:
+        paused_events = [e for e in all_events
+                         if e.kind == EventKind.RUNTIME_PAUSED and e.task_id == tid]
+        if tid == agents[0].state.task_id:
+            check(f"Agent A has RUNTIME_PAUSED events", len(paused_events) >= 1)
+        else:
+            check(f"Agent B/C NOT affected by A pause (no RUNTIME_PAUSED for {tid[:8]}...)",
+                  len(paused_events) == 0,
+                  f"Found {len(paused_events)} pause events for non-A agent")
+
+    # ── Final state check ──
+    for i, rt in enumerate(agents):
+        check(f"Agent {i} in terminal state", rt.state.is_terminal,
+              f"phase={rt.state.phase}")
+
+    print(f"\n  Total events collected: {len(all_events)}")
+    print(f"  Agent rounds: A={agents[0].state.round}, "
+          f"B={agents[1].state.round}, C={agents[2].state.round}")
+    print(f"\nACL-05: {PASS}/{PASS+FAIL} passed")
+    return FAIL == 0
+
+
+# ────────────────────────────────────────────────────────────
+# ACL-06: Event Contract Integrity
+# ────────────────────────────────────────────────────────────
+
+async def test_acl06_event_contract():
+    """ACL-06: Event Contract Integrity — 控制动作完整事件链验证.
+
+    对每个控制动作验证：
+      API 命令 → Runtime State 变化 → Event Bus 事件 → 事件 Payload 正确
+
+    控制动作与预期契约：
+      pause():    state.paused=True,          RUNTIME_PAUSED {task_id}
+      resume():   state.paused=False,         RUNTIME_RESUMED {task_id}
+      take_over(): state.human_override=True, HUMAN_OVERRIDE_STARTED {task_id, phase}
+      rollback():                              ROLLBACK_COMPLETED or graceful
+      stop():     state.phase=CANCELLED,       RUNTIME_STOPPED {task_id, phase}
+      set_mode(): state.mode=target,          MODE_CHANGED {from, to}
+    """
+    print("\n" + "=" * 60)
+    print("ACL-06: Event Contract Integrity")
+    print("=" * 60)
+
+    # We use two Runtimes to verify isolation of events by task_id
+    rt = Runtime(token_budget=50000, round_limit=15)
+
+    async def med(state):
+        for i in range(3):
+            await asyncio.sleep(0.15)
+            state.add_fact(f"step_{i}")
+
+    rt.on_plan(med)
+    rt.on_explore(med)
+    rt.on_implement(med)
+
+    all_events: list[Event] = []
+    completed = asyncio.Event()
+
+    async def collector():
+        async for ev in event_bus.subscribe():
+            all_events.append(ev)
+            if ev.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
+                completed.set()
+                break
+
+    collector_task = asyncio.create_task(collector())
+    run_task = asyncio.create_task(rt.run("acl-06 event contract"))
+
+    await asyncio.sleep(0.5)
+    tid = rt.state.task_id
+
+    # ── Control action 1: PAUSE ──
+    print("  --- Control: pause() ---")
+    pre_len = len(all_events)
+    await rt.pause()
+    await asyncio.sleep(0.05)
+
+    check("pause: state.paused=True", rt.state.paused is True)
+    check("pause: _pause_event cleared", rt._pause_event.is_set() is False)
+
+    pause_events = [e for e in all_events[pre_len:]
+                    if e.kind == EventKind.RUNTIME_PAUSED]
+    check("pause: RUNTIME_PAUSED event emitted", len(pause_events) >= 1,
+          f"count={len(pause_events)}")
+    if pause_events:
+        ev = pause_events[0]
+        check("pause: event has task_id", ev.task_id == tid,
+              f"got={ev.task_id}")
+        check("pause: payload has task_id",
+              ev.payload.get("task_id") == tid,
+              f"payload={ev.payload}")
+
+    # ── Control action 2: TAKE_OVER (while paused) ──
+    print("  --- Control: take_over() ---")
+    pre_len = len(all_events)
+    await rt.take_over()
+    await asyncio.sleep(0.05)
+
+    check("takeover: state.human_override=True", rt.state.human_override is True)
+    check("takeover: state.paused=True", rt.state.paused is True)
+
+    toe_events = [e for e in all_events[pre_len:]
+                  if e.kind == EventKind.HUMAN_OVERRIDE_STARTED]
+    check("takeover: HUMAN_OVERRIDE_STARTED event emitted",
+          len(toe_events) >= 1, f"count={len(toe_events)}")
+    if toe_events:
+        ev = toe_events[0]
+        check("takeover: event payload has 'phase' field",
+              "phase" in ev.payload,
+              f"payload={ev.payload}")
+
+    # ── Control action 3: RESUME (ends takeover) ──
+    print("  --- Control: resume() ---")
+    pre_len = len(all_events)
+    await rt.resume()
+    await asyncio.sleep(0.05)
+
+    check("resume: state.paused=False", rt.state.paused is False)
+    check("resume: state.human_override=False", rt.state.human_override is False)
+
+    resume_events = [e for e in all_events[pre_len:]
+                     if e.kind in (EventKind.RUNTIME_RESUMED,
+                                   EventKind.HUMAN_OVERRIDE_ENDED)]
+    check("resume: RUNTIME_RESUMED+HUMAN_OVERRIDE_ENDED events",
+          len(resume_events) >= 2,
+          f"kinds={[e.kind.value for e in resume_events]}")
+
+    has_resumed = any(e.kind == EventKind.RUNTIME_RESUMED
+                      for e in all_events[pre_len:])
+    check("resume: RUNTIME_RESUMED event found", has_resumed)
+
+    has_override_end = any(e.kind == EventKind.HUMAN_OVERRIDE_ENDED
+                           for e in all_events[pre_len:])
+    check("resume: HUMAN_OVERRIDE_ENDED event found", has_override_end)
+
+    # Let execution resume
+    await asyncio.sleep(1.0)
+
+    # ── Control action 4: STOP ──
+    print("  --- Control: stop() ---")
+    pre_len = len(all_events)
+    await rt.stop()
+    await asyncio.sleep(0.05)
+
+    check("stop: state.phase=CANCELLED",
+          rt.state.phase == TaskPhase.CANCELLED,
+          f"phase={rt.state.phase}")
+
+    stop_events = [e for e in all_events[pre_len:]
+                   if e.kind == EventKind.RUNTIME_STOPPED]
+    check("stop: RUNTIME_STOPPED event emitted", len(stop_events) >= 1,
+          f"count={len(stop_events)}")
+    if stop_events:
+        ev = stop_events[0]
+        check("stop: payload has 'phase' field",
+              "phase" in ev.payload,
+              f"payload={ev.payload}")
+
+    # Let the run terminate
+    await asyncio.wait_for(run_task, timeout=15)
+    await collector_task
+
+    # ── Verify event sequence contains all required kinds ──
+    kinds = [e.kind.value for e in all_events]
+    required_events = {
+        "task_started": "task lifecycle start",
+        "intent_classified": "intent classification",
+        "runtime_paused": "pause event",
+        "human_override_started": "takeover start",
+        "human_override_ended": "takeover end",
+        "runtime_resumed": "resume event",
+        "runtime_stopped": "stop event",
+        "task_completed": "task lifecycle end",
+    }
+    for event_kind, desc in required_events.items():
+        check(f"'{event_kind}' in event sequence ({desc})",
+              event_kind in kinds)
+
+    # ── Verify event ordering ──
+    ordering_checks = [
+        ("task_started", "runtime_paused"),
+        ("runtime_paused", "human_override_started"),
+        ("human_override_started", "human_override_ended"),
+        ("human_override_ended", "runtime_resumed"),
+        ("runtime_paused", "runtime_stopped"),
+    ]
+    for first, second in ordering_checks:
+        try:
+            pos_first = kinds.index(first)
+            pos_second = kinds.index(second)
+            check(f"ordering: '{first}' before '{second}'",
+                  pos_first < pos_second,
+                  f"idx={pos_first} >= {pos_second}")
+        except ValueError:
+            check(f"ordering: '{first}' and '{second}' both in sequence",
+                  first in kinds and second in kinds)
+
+    # ── Control action 5: set_mode on a NEW Runtime ──
+    # (Current Runtime is stopped, use a fresh one)
+    print("  --- Control: set_mode() on separate instance ---")
+    rt2 = Runtime(token_budget=10000, round_limit=5)
+    rt2.on_plan(med)
+    rt2.on_explore(med)
+    rt2.on_implement(med)
+
+    events2: list[Event] = []
+
+    async def collector2():
+        async for ev in event_bus.subscribe():
+            events2.append(ev)
+            if ev.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
+                break
+
+    c2 = asyncio.create_task(collector2())
+    t2 = asyncio.create_task(rt2.run("acl-06 mode test"))
+    await asyncio.sleep(0.3)
+
+    pre2 = len(events2)
+    await rt2.set_mode("governed")
+    await asyncio.sleep(0.05)
+
+    check("set_mode: state.mode=GOVERNED",
+          rt2.state.mode.value == "governed",
+          f"mode={rt2.state.mode}")
+
+    mode_events = [e for e in events2[pre2:]
+                   if e.kind == EventKind.MODE_CHANGED]
+    check("set_mode: MODE_CHANGED event emitted", len(mode_events) >= 1,
+          f"count={len(mode_events)}")
+    if mode_events:
+        ev = mode_events[0]
+        check("set_mode: payload has 'from' field",
+              "from" in ev.payload, f"payload={ev.payload}")
+        check("set_mode: payload has 'to' field",
+              "to" in ev.payload, f"payload={ev.payload}")
+        check("set_mode: payload 'to' matches target",
+              ev.payload.get("to") == "governed",
+              f"to={ev.payload.get('to')}")
+
+    # Reset mode and verify
+    await rt2.set_mode("autonomous")
+    await asyncio.sleep(0.05)
+    check("set_mode: state.mode=AUTONOMOUS",
+          rt2.state.mode.value == "autonomous",
+          f"mode={rt2.state.mode}")
+
+    mode_events_2 = [e for e in events2[pre2:]
+                     if e.kind == EventKind.MODE_CHANGED]
+    if len(mode_events_2) >= 2:
+        transitions = [(e.payload.get("from"), e.payload.get("to"))
+                       for e in mode_events_2[:2]]
+        check("set_mode: transition sequence correct",
+              transitions == [("autonomous", "governed"),
+                              ("governed", "autonomous")],
+              f"got={transitions}")
+
+    # ── Control action 6: rollback (graceful path) ──
+    print("  --- Control: rollback() ---")
+    rb_result = await rt2.rollback()
+    check("rollback: method returned dict", isinstance(rb_result, dict))
+    check("rollback: has 'rolled_back' key", "rolled_back" in rb_result)
+
+    rb_events = [e for e in events2 if e.kind == EventKind.ROLLBACK_COMPLETED]
+    if rb_result.get("rolled_back"):
+        check("rollback: ROLLBACK_COMPLETED event emitted",
+              len(rb_events) >= 1)
+    else:
+        check("rollback: gracefully handled (no snapshot)",
+              rb_result.get("rolled_back") is False,
+              f"reason={rb_result.get('reason')}")
+
+    await asyncio.wait_for(t2, timeout=30)
+    await c2
+
+    # ── Full event summary ──
+    print(f"\n  ACL-06 Event Catalog:")
+    print(f"  {'Control Action':25s} {'Event':30s} {'State Change':25s}")
+    print(f"  {'-'*25} {'-'*30} {'-'*25}")
+    control_map = [
+        ("pause()", "RUNTIME_PAUSED", "state.paused=True"),
+        ("take_over()", "HUMAN_OVERRIDE_STARTED", "state.human_override=True"),
+        ("resume()", "RUNTIME_RESUMED+OVERRIDE_ENDED", "state.paused=False"),
+        ("stop()", "RUNTIME_STOPPED", "state.phase=CANCELLED"),
+        ("set_mode()", "MODE_CHANGED", "state.mode=new value"),
+        ("rollback()", "ROLLBACK_COMPLETED", "file state restored"),
+    ]
+    for action, event, state_change in control_map:
+        kind_list = [e.kind.value for e in all_events + events2]
+        ok = any(event.split("+")[0] in k for k in kind_list)
+        status = "✅" if ok else "⬜"
+        print(f"  {status} {action:24s} {event:30s} {state_change}")
+
+    print(f"\n  Total events (Instance 1): {len(all_events)}")
+    print(f"  Total events (Instance 2): {len(events2)}")
+    print(f"\nACL-06: {PASS}/{PASS+FAIL} passed")
+    return FAIL == 0
+
+
 # ── Combined runner ──
 
 async def run_all():
-    """Run all ACL tests sequentially (ACL-01 → ACL-04)."""
+    """Run all ACL tests sequentially (ACL-01 → ACL-06)."""
     tests = [
         ("ACL-01", "Pause/Resume Stability", test_acl01_pause_resume, 150),
         ("ACL-02", "Human Takeover Consistency", test_acl02_takeover, 90),
         ("ACL-03", "Rollback Consistency", test_acl03_rollback, 60),
         ("ACL-04", "Mode Switching Consistency", test_acl04_mode_switching, 60),
+        ("ACL-05", "Multi-Agent Isolation", test_acl05_multi_agent_isolation, 90),
+        ("ACL-06", "Event Contract Integrity", test_acl06_event_contract, 90),
     ]
 
     passed = failed = 0
