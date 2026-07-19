@@ -29,5 +29,5 @@ Thumbs.db
 server.log
 server.err
 
-# Temp test files
-test_*.py
+# Temp test files (root only)
+/test_*.py
