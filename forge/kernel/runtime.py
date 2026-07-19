@@ -107,8 +107,8 @@ class Runtime:
         """Execute a goal through the runtime loop."""
         start_time = datetime.now(timezone.utc)
 
-        # Initialize state only if not already set (preserves task_id from API)
-        if not self.state.goal:
+        # Reuse state if task_id is already set (e.g. created via API)
+        if not hasattr(self.state, 'task_id') or not self.state.task_id:
             self.state = RuntimeState()
         self.state.goal = goal
         self.state.phase = TaskPhase.INIT
